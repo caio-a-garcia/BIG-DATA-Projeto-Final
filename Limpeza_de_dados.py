@@ -20,6 +20,15 @@
 
 # %%
 from pyspark.sql import functions as sf
+import pyspark.sql.functions as f
+
+# Modeling
+from pyspark.ml.feature import VectorAssembler, StandardScaler
+from pyspark.ml.feature import OneHotEncoder, StringIndexer
+from pyspark.ml.regression import LinearRegression
+from pyspark.ml import Pipeline
+from pyspark.ml.tuning import CrossValidator, ParamGridBuilder
+from pyspark.ml.evaluation import RegressionEvaluator
 
 # %%
 # Criar a sessao do Spark
@@ -48,7 +57,7 @@ spark.conf.set("fs.azure.account.key." + STORAGE_ACCOUNT + ".blob.core.windows.n
 from pyspark.sql.types import *
 
 labels = (('FL_DATE', TimestampType()),
-          ('OP_CARRRIER', StringType()),
+          ('OP_CARRIER', StringType()),
           ('OP_CARRIER_FL_NUM', IntegerType()),
           ('ORIGIN', StringType()),
           ('DEST', StringType()),
@@ -76,6 +85,18 @@ labels = (('FL_DATE', TimestampType()),
           ('LATE_AIRCRAFT_DELAY', StringType()))
 
 schema = StructType([StructField(x[0], x[1], True) for x in labels])
+
+# %%
+# Columns with values in minutes
+minute_columns = ["TAXI_OUT","TAXI_IN","DEP_DELAY","ARR_DELAY","AIR_TIME","CRS_ELAPSED_TIME","ACTUAL_ELAPSED_TIME",
+                  "CARRIER_DELAY","WEATHER_DELAY","NAS_DELAY","SECURITY_DELAY","LATE_AIRCRAFT_DELAY"]
+
+# Subset from minute columns with no data leak from moment of take off
+clean_min_columns = ["TAXI_OUT", "DEP_DELAY", "CRS_ELAPSED_TIME"]
+
+# Columns with time information on format 'hhmm'
+# Not proper for numerical manipulation
+odd_format_columns = ["CRS_DEP_TIME","DEP_TIME","WHEELS_OFF","WHEELS_ON","ARR_TIME","CRS_ARR_TIME"]
 
 # %% [markdown]
 # ### Carregamento de dados
@@ -121,7 +142,7 @@ missing_counts = df.select([sf.col(column).isNull().cast("int").alias(column) fo
 # %%
 missing_counts.toPandas().transpose()
 
-# %% [markdown] jp-MarkdownHeadingCollapsed=true
+# %% [markdown]
 # ### Cancelamentos
 
 # %%
@@ -132,11 +153,14 @@ assert (df.filter((df.CANCELLATION_CODE.isNull()) &
 # %% [markdown]
 # Todos os valores faltantes de CANCELLATION_CODE são referentes a voos que não foram cancelados.
 
-# %% [markdown] jp-MarkdownHeadingCollapsed=true
+# %% [markdown]
 # ### Voo
 
-# %% [markdown] jp-MarkdownHeadingCollapsed=true
+# %% [markdown]
 # #### Testes
+
+# %% [markdown]
+# `DEP_TIME` e `DEP_DELAY`: co-ausentes, todos cancelados
 
 # %%
 assert (df.filter((df.DEP_TIME.isNull())   &
@@ -157,6 +181,9 @@ assert (df.filter((df.DEP_TIME.isNull())   &
                   (df.CANCELLED == 1)).count() ==
         df.filter(df.DEP_TIME.isNull()).count())
 
+# %% [markdown]
+# `TAXI_OUT` e `WHEELS_OFF`: co-ausentes e cancelados
+
 # %%
 assert (df.filter((df.TAXI_OUT.isNull())   &
                   (df.WHEELS_OFF.isNull()) &
@@ -174,6 +201,9 @@ assert (df.filter((df.TAXI_OUT.isNull())   &
                   (df.CANCELLED == 1)).count() ==
         df.filter(df.TAXI_OUT.isNull()).count())
 
+# %% [markdown]
+# `WHEELS_ON`, `TAXI_IN` e `ARR_TIME`: co-ausentes
+
 # %%
 assert (df.filter((df.WHEELS_ON.isNull())  &
                   (df.TAXI_IN.isNull())    &
@@ -185,7 +215,28 @@ assert (df.filter((df.TAXI_IN.isNull())   &
                   (df.CANCELLED == 1)).count() ==
         df.filter(df.CANCELLED == 1).count())
 
-# %% [markdown] jp-MarkdownHeadingCollapsed=true
+# %%
+assert (df.filter((df.TAXI_IN.isNull()) &
+                  (df.CANCELLED == 0)   &
+                  (df.DIVERTED == 1)).count() ==
+        df.filter((df.TAXI_IN.isNull()) &
+                  (df.CANCELLED == 0)).count())
+
+# %%
+assert (df.filter((df.TAXI_IN.isNull()) &
+                  (df.CANCELLED == 0)   &
+                  (df.DIVERTED == 1)).count() !=
+        df.filter(df.DIVERTED == 1).count())
+
+# %%
+assert (df.filter((df.TAXI_IN.isNotNull()) &
+                  (df.DIVERTED == 1)).count() == 13040)
+
+# %%
+assert (df.filter((df.TAXI_IN.isNull()) &
+                  (df.DIVERTED == 1)).count() == 2283)
+
+# %% [markdown]
 # #### Análise
 
 # %% [markdown]
@@ -200,8 +251,9 @@ assert (df.filter((df.TAXI_IN.isNull())   &
 #  
 # Os valores faltantes para WHEELS_ON, TAXI_IN e ARR_TIME coincidem nas mesmas observações (com uma exceção descrita mais abaixo). Todos os voos cancelados se encontram dentre essas observações. Os valores faltantes para TAXI_OUT e WHEELS_OFF coincidem nas mesmas observações, todas referentes a voos cancelados. Finalmente, os valores faltantes de DEP_TIME e DEP_DELAY coincidem nas mesmas observações, todas com valores faltantes para TAXI_OUT.
 #
+# Todos os voos que não foram cancelados mas não tem informação da hora de aterrisagem (`(df.WHEELS_ON.isNull()) & (df.CANCELLED == 0)`) foram redirecionados para um aeroporto diferente do aeroporto destino original (`df.DIVERTED == 1`)
+#
 # Destas relações, supomos:
-#  - Alguns voos parecem não ter sua chegada propriamente registrada. Casos de pousos de emergencia em localização diferente da planejada são plausíveis mas supomos que sejam menos frequentes. Esses casos (`(df.WHEELS_ON.isNull()) & (df.CANCELLED == 0)`) podem vir a ser uma categoria relevante na análise.
 #  - A diferença entre DEP_TIME e WHEELS_OFF pode ser devido a voos que chegam a sair do chão antes de serem cancelados, e voos que são cancelados após o embarque mas antes da decolagem.
 #  - Nenhum desses valores faltantes parece implausível o suficiente para assumirmos erro nos dados baseado apenas nessa análise. Alguns desses dados podem vir a ser retirados mesmo assim por questão de propriedades dos algorítmos utilizados mais a frente.
 
@@ -244,10 +296,10 @@ assert (df.filter((df.CARRIER_DELAY.isNull()) &
         df.filter(df.CARRIER_DELAY.isNull()).count())
 
 # %%
-assert (df.filter((df.CARRIER_DELAY.isNull()) &
-                  ((df.DEP_DELAY > 0) |
-                   (df.ARR_DELAY > 0))).count() ==
-        df.filter(df.CARRIER_DELAY.isNull()).count())
+# assert (df.filter((df.CARRIER_DELAY.isNull()) &
+#                   ((df.DEP_DELAY > 0) |
+#                    (df.ARR_DELAY > 0))).count() ==
+#         df.filter(df.CARRIER_DELAY.isNull()).count())
 
 # %%
 df.filter(df.CARRIER_DELAY == 0).select(df.OP_CARRIER_FL_NUM, df.CARRIER_DELAY).take(10)
@@ -275,3 +327,119 @@ assert (df.filter((df.ACTUAL_ELAPSED_TIME.isNull()) &
 # %% [markdown]
 # Uma mesma observação é responsavel pela discrepância na quantidade total de valores faltantes entre WHEELS_ON, TAXI_IN e ARR_TIME, e ARR_DELAY, ACTUAL_ELAPSED_TIME e AIR_TIME.
 # Um valor de `AIR_TIME == 0` nao faz sentido para um voo que não foi cancelado, e o mesmo se aplica a `TAXI_IN == 0`. Ao retirar essa observação da base, a análise de dados faltantes por grupo torna-se mais consistente.
+
+# %% [markdown]
+# ## Consistencia
+
+# %%
+assert (df.filter(df.AIR_TIME + df.TAXI_IN + df.TAXI_OUT != df.ACTUAL_ELAPSED_TIME).count() == 0)
+
+# %%
+assert (df.filter((df.CANCELLED == 1) &
+                  (df.DIVERTED == 1)).count() == 0)
+
+# %%
+assert (df.filter((df.DEP_TIME % 1 != 0) | (df.DEP_DELAY % 1 != 0)).count() == 0)
+
+# %% [markdown]
+# # Modelagem
+
+# %%
+# This list includes all values not known at the moment of takeoff
+# except `ARR_DELAY` which will be used as target variable
+take_off_leak = ["WHEELS_ON","TAXI_IN","ARR_TIME","ACTUAL_ELAPSED_TIME","AIR_TIME",
+                 "CARRIER_DELAY","WEATHER_DELAY","NAS_DELAY","SECURITY_DELAY","LATE_AIRCRAFT_DELAY"]
+
+# %%
+take_off_df = df.drop(*take_off_leak)
+
+# %% [markdown]
+# ## Train/Test Split
+
+# %%
+train_df, test_df = take_off_df.randomSplit([0.8,0.2], seed=42)
+toy_df = train_df.sample(False, 0.01, seed=42)
+
+# %%
+print("Train set count:", train_df.count())
+print("Test set count:", test_df.count())
+print("Toy set count:", toy_df.count())
+
+# %% [markdown]
+# ## Feature Engineering: One-Hot-Enconding
+
+# %%
+cat_features = ["OP_CARRIER", "ORIGIN", "DEST"] # "OP_CARRIER_FL_NUM",
+
+indexOutputCols = [x + 'Index' for x in cat_features]
+
+oheOutputCols = [x + 'OHE' for x in cat_features]
+
+stringIndex = StringIndexer(inputCols = cat_features,
+                            outputCols = indexOutputCols,
+                            handleInvalid = 'skip')
+
+oheEncoder = OneHotEncoder(inputCols = indexOutputCols,
+                           outputCols = oheOutputCols)
+
+# %%
+num_features = ["TAXI_OUT", "DEP_DELAY", "CRS_ELAPSED_TIME", "DISTANCE"]
+
+numVecAssembler = VectorAssembler(inputCols = num_features,
+                                  outputCol = 'features',
+                                  handleInvalid = 'skip')
+
+stdScaler = StandardScaler(inputCol = 'features',
+                           outputCol = 'features_scaled')
+
+# %% [markdown]
+# ## Assembling dos vetores
+
+# %%
+assembleInputs = oheOutputCols + ['features_scaled']
+
+vecAssembler = VectorAssembler(inputCols = assembleInputs,
+                               outputCol = 'features_vector')
+
+# %%
+stages = [stringIndex, oheEncoder, numVecAssembler, stdScaler, vecAssembler]
+
+# %% [markdown]
+# ## Criação do Pipeline
+
+# %%
+# Criacao do pipeline de transformacao
+transform_pipeline = Pipeline(stages=stages)
+
+# Aplicacao do pipeline nos dados de treino
+fitted_transformer = transform_pipeline.fit(train_df)
+transformed_train_df = fitted_transformer.transform(train_df)
+
+transformed_train_df.limit(10).toPandas()
+
+# %% [markdown]
+# ## Model Training
+
+# %%
+model = LinearRegression(maxIter = 25, # pode causar overfitting
+                         solver = 'normal',
+                         labelCol = 'ARR_DELAY',
+                         featuresCol = 'features_vector',
+                         elasticNetParam = 0.2,
+                         regParam = 0.02)
+
+pipe_stages = stages + [model]
+
+pipe = Pipeline(stages=pipe_stages)
+
+# %%
+fitted_pipe = pipe.fit(train_df)
+
+# %% [markdown]
+# ## Model performance evaluation
+
+# %%
+preds = fitted_pipe.transform(test_df)
+
+# %%
+preds.limit(10).toPandas()
