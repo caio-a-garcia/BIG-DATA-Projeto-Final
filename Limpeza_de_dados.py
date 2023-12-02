@@ -40,6 +40,11 @@ TOKEN = 'lSuH4ZI9BhOFEhCF/7ZQbrpPBIhgtLcPDfXjJ8lMxQZjaADW4p6tcmiZGDX9u05o7FqSE2t
 
 spark.conf.set("fs.azure.account.key." + STORAGE_ACCOUNT + ".blob.core.windows.net", TOKEN)
 
+# %%
+## Bibliotecas Gráficas
+import seaborn as sns
+import matplotlib.pyplot as plt
+
 # %% [markdown]
 # ### Schema
 # Schema definido de acordo com o dicionário de dados em `projeto_final_dicionário.xlsx`
@@ -81,28 +86,81 @@ schema = StructType([StructField(x[0], x[1], True) for x in labels])
 # ### Carregamento de dados
 # Dados carregados da nuvem como spark data frame
 
+# %% [markdown]
+# Exemplo para o ano de 2009:
+
 # %%
 config = spark.sparkContext._jsc.hadoopConfiguration()
 config.set("fs.azure.account.key." + STORAGE_ACCOUNT + ".blob.core.windows.net", TOKEN)
 sc = spark.sparkContext
 
-df = spark.read.csv("wasbs://{}@{}.blob.core.windows.net/{}/2009.csv"\
+df_exemple = spark.read.csv("wasbs://{}@{}.blob.core.windows.net/{}/2009.csv"\
                     .format(CONTAINER, STORAGE_ACCOUNT, FOLDER), header=True, schema=schema)
-df.take(2)
-
-# %%
-OBSERVACOES = df.count()
-assert (OBSERVACOES == 6429338)
+df_exemple.take(2)
 
 # %% [markdown]
-# A base contem 6429338 observações.
+# Como temos dados para os anos de 2009 até o ano de 2018. Iremos criar um dicionario contendo os dataframes de cada ano separadamente. 
 
 # %%
-CANCELAMENTOS = df.filter(df.CANCELLED == 1).count()
-assert (CANCELAMENTOS == 87038)
+# Criando dicionario de dataframes
+df_for_year = {}
+
+# Loop lendo arquivo de cada ano e salvando no dicionario
+for year in range(2009, 2019):
+    # Ajustando o caminho
+    file_path = "wasbs://{}@{}.blob.core.windows.net/{}/{}.csv"\
+                    .format(CONTAINER, STORAGE_ACCOUNT, FOLDER, year)
+    
+    # lendo arquivo csv 
+    df_name = "df_{}".format(year)
+    df = spark.read.csv(file_path, header=True, schema=schema)
+    
+    # Adicionando df ao dicionario de dataframes 
+    df_for_year[df_name] = df
+    
+
+# Visualizando as primeiras linhas de 2012
+df_for_year["df_2012"].take(5)
 
 # %% [markdown]
-# Dos voos na base, 87038 foram cancelados.
+# Com todos os dataframes pré-importados(lazy) podemos realizar um merge unindo todos os anos.
+
+# %%
+# Importando função reduce para realizar o merge
+from functools import reduce 
+
+# %%
+# União de todos os DataFrames em um único Data frame
+df_final = reduce(sf.DataFrame.union, df_for_year.values())
+
+# Criando a coluna "year" baseada na coluna "date"
+df_final = df_final.withColumn("year", sf.year("FL_DATE"))
+
+# Exibindo as primeiras linhas
+df_final.take(10)
+
+# %% [markdown]
+# Assim, temos o dataframe com todos os anos.
+
+# %%
+OBSERVACOES = df_final.count()
+assert (OBSERVACOES == 61556964)
+
+# %%
+OBSERVACOES
+
+# %% [markdown]
+# A base contem 61556964 observações.
+
+# %%
+CANCELAMENTOS = df_final.filter(df_final.CANCELLED == 1).count()
+assert (CANCELAMENTOS == 973209)
+
+# %%
+CANCELAMENTOS
+
+# %% [markdown]
+# Dos voos na base, 973209 foram cancelados.
 
 # %% [markdown]
 # ## Tratamento de dados faltantes
@@ -114,78 +172,122 @@ assert (CANCELAMENTOS == 87038)
 # ### Resumo
 
 # %%
-missing_counts = df.select([sf.col(column).isNull().cast("int").alias(column) for column in df.columns]) \
+missing_counts = df_final.select([sf.col(column).isNull().cast("int").alias(column) for column in df_final.columns]) \
                        .groupBy() \
                        .sum()
 
 # %%
-missing_counts.toPandas().transpose()
+# Criando dataframe de colunas com valores zerados
+missing_counts_df = missing_counts.toPandas().transpose()
 
-# %% [markdown] jp-MarkdownHeadingCollapsed=true
+# Filtrando apenas colunas com valores nulos
+missing_counts_df = missing_counts_df[missing_counts_df[0]>0]
+
+# Renomeando a coluna
+missing_counts_df = missing_counts_df.rename(columns={0:"nulos"})
+
+# %%
+# Contando número de colunas com valores nulos
+print("Número de colunas com valores faltantes:")
+missing_counts_df.count()[0]
+
+# %%
+# Cálculando porcentagem de valores faltantes
+missing_counts_df["%nulos"] = (missing_counts_df["nulos"]/OBSERVACOES) * 100
+
+# Ordenando por % de nulos
+missing_counts_df = missing_counts_df.sort_values("%nulos", ascending=False)
+
+# Visualizando resultados
+missing_counts_df
+
+# %%
+# Visualizando missing em gráfico de barras
+# Ajustando o tamanho da figura
+plt.figure(figsize=(10, 4))
+
+# Plotando o gráfico de barras
+sns.barplot(x=missing_counts_df.index, y=missing_counts_df["%nulos"], color="red")
+
+# Adicionando inclinação aos valores do eixo x
+plt.xticks(rotation=45, ha='right')
+
+# Adicionando título e rótulos aos eixos
+plt.title('Gráfico de Barras')
+plt.xlabel("Colunas")
+plt.ylabel("%Nulos")
+
+# Exibindo o gráfico
+plt.show()
+
+# %% [markdown]
+# Conforme evidenciado no gráfico apresentado, nota-se que a coluna "CANCELLATION_CODE" exibe uma lacuna em praticamente 100% dos dados, enquanto as colunas "LATE_AIRCRAFT_DELAY", "NAS_DELAY", "WEATHER_DELAY", "CARRIER_DELAY" e "SECURITY_DELAY" apresentam uma ausência de informações em torno de 80%.
+
+# %% [markdown]
 # ### Cancelamentos
 
 # %%
-assert (df.filter((df.CANCELLATION_CODE.isNull()) &
-                  (df.CANCELLED == 0)).count() ==
-        df.filter(df.CANCELLED == 0).count())
+assert (df_final.filter((df_final.CANCELLATION_CODE.isNull()) &
+                  (df_final.CANCELLED == 0)).count() ==
+        df_final.filter(df_final.CANCELLED == 0).count())
 
 # %% [markdown]
 # Todos os valores faltantes de CANCELLATION_CODE são referentes a voos que não foram cancelados.
 
-# %% [markdown] jp-MarkdownHeadingCollapsed=true
+# %% [markdown]
 # ### Voo
 
-# %% [markdown] jp-MarkdownHeadingCollapsed=true
+# %% [markdown]
 # #### Testes
 
 # %%
-assert (df.filter((df.DEP_TIME.isNull())   &
-                  (df.DEP_DELAY.isNull())  &
-                  (df.TAXI_OUT.isNull())   &
-                  (df.WHEELS_OFF.isNull()) &
-                  (df.WHEELS_ON.isNull())  &
-                  (df.TAXI_IN.isNull())    &
-                  (df.ARR_TIME.isNull())).count() ==
-        df.filter(df.DEP_TIME.isNull()).count())
+assert (df_final.filter((df_final.DEP_TIME.isNull())   &
+                  (df_final.DEP_DELAY.isNull())  &
+                  (df_final.TAXI_OUT.isNull())   &
+                  (df_final.WHEELS_OFF.isNull()) &
+                  (df_final.WHEELS_ON.isNull())  &
+                  (df_final.TAXI_IN.isNull())    &
+                  (df_final.ARR_TIME.isNull())).count() ==
+        df_final.filter(df_final.DEP_TIME.isNull()).count())
 
-assert (df.filter((df.DEP_TIME.isNull())   &
-                  (df.DEP_DELAY.isNull())).count() ==
-        df.filter(df.DEP_TIME.isNull()).count())
-
-# %%
-assert (df.filter((df.DEP_TIME.isNull())   &
-                  (df.CANCELLED == 1)).count() ==
-        df.filter(df.DEP_TIME.isNull()).count())
+assert (df_final.filter((df_final.DEP_TIME.isNull())   &
+                  (df_final.DEP_DELAY.isNull())).count() ==
+        df_final.filter(df_final.DEP_TIME.isNull()).count())
 
 # %%
-assert (df.filter((df.TAXI_OUT.isNull())   &
-                  (df.WHEELS_OFF.isNull()) &
-                  (df.WHEELS_ON.isNull())  &
-                  (df.TAXI_IN.isNull())    &
-                  (df.ARR_TIME.isNull())).count() ==
-        df.filter(df.TAXI_OUT.isNull()).count())
-
-assert (df.filter((df.TAXI_OUT.isNull())   &
-                  (df.WHEELS_OFF.isNull())).count() ==
-        df.filter(df.TAXI_OUT.isNull()).count())
+assert (df_final.filter((df_final.DEP_TIME.isNull())   &
+                  (df_final.CANCELLED == 1)).count() ==
+        df_final.filter(df_final.DEP_TIME.isNull()).count())
 
 # %%
-assert (df.filter((df.TAXI_OUT.isNull())   &
-                  (df.CANCELLED == 1)).count() ==
-        df.filter(df.TAXI_OUT.isNull()).count())
+assert (df_final.filter((df_final.TAXI_OUT.isNull())   &
+                  (df_final.WHEELS_OFF.isNull()) &
+                  (df_final.WHEELS_ON.isNull())  &
+                  (df_final.TAXI_IN.isNull())    &
+                  (df_final.ARR_TIME.isNull())).count() ==
+        df_final.filter(df_final.TAXI_OUT.isNull()).count())
+
+assert (df_final.filter((df_final.TAXI_OUT.isNull())   &
+                  (df_final.WHEELS_OFF.isNull())).count() ==
+        df_final.filter(df_final.TAXI_OUT.isNull()).count())
 
 # %%
-assert (df.filter((df.WHEELS_ON.isNull())  &
-                  (df.TAXI_IN.isNull())    &
-                  (df.ARR_TIME.isNull())).count() ==
-        df.filter(df.TAXI_IN.isNull()).count())
+assert (df_final.filter((df_final.TAXI_OUT.isNull())   &
+                  (df_final.CANCELLED == 1)).count() ==
+       df_final.filter(df_final.TAXI_OUT.isNull()).count())
 
 # %%
-assert (df.filter((df.TAXI_IN.isNull())   &
-                  (df.CANCELLED == 1)).count() ==
-        df.filter(df.CANCELLED == 1).count())
+assert (df_final.filter((df_final.WHEELS_ON.isNull())  &
+                  (df_final.TAXI_IN.isNull())    &
+                  (df_final.ARR_TIME.isNull())).count() ==
+        df_final.filter(df_final.TAXI_IN.isNull()).count())
 
-# %% [markdown] jp-MarkdownHeadingCollapsed=true
+# %%
+assert (df_final.filter((df_final.TAXI_IN.isNull())   &
+                  (df_final.CANCELLED == 1)).count() ==
+        df_final.filter(df_final.CANCELLED == 1).count())
+
+# %% [markdown]
 # #### Análise
 
 # %% [markdown]
